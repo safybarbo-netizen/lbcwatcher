@@ -1,37 +1,57 @@
-"""Connexion PostgreSQL via asyncpg."""
-import asyncpg, os
-from functools import lru_cache
+"""Connexion PostgreSQL via psycopg2 (compatible Python 3.14)."""
+import psycopg2
+import psycopg2.extras
+import os
+from contextlib import contextmanager
 
-_pool = None
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 class Database:
     def __init__(self, conn):
         self._conn = conn
-    async def fetchrow(self, q, *a): return await self._conn.fetchrow(q, *a)
-    async def fetchval(self, q, *a): return await self._conn.fetchval(q, *a)
-    async def fetch(self, q, *a):    return await self._conn.fetch(q, *a)
-    async def execute(self, q, *a):  return await self._conn.execute(q, *a)
-    async def close(self):           await self._conn.close()
+        self._cur = conn.cursor()
 
-async def get_pool():
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(os.getenv("DATABASE_URL","postgresql://lbcwatcher:password@localhost/lbcwatcher"))
-    return _pool
+    def fetchrow(self, q, *a):
+        self._cur.execute(q, a)
+        return self._cur.fetchone()
+
+    def fetchval(self, q, *a):
+        self._cur.execute(q, a)
+        row = self._cur.fetchone()
+        if row is None: return None
+        return list(row.values())[0]
+
+    def fetch(self, q, *a):
+        self._cur.execute(q, a)
+        return self._cur.fetchall()
+
+    def execute(self, q, *a):
+        self._cur.execute(q, a)
+        self._conn.commit()
+
+    def close(self):
+        self._cur.close()
+        self._conn.close()
 
 async def get_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield Database(conn)
+    conn = get_connection()
+    db = Database(conn)
+    try:
+        yield db
+    finally:
+        db.close()
 
 async def get_db_direct():
-    conn = await asyncpg.connect(os.getenv("DATABASE_URL","postgresql://lbcwatcher:password@localhost/lbcwatcher"))
+    conn = get_connection()
     return Database(conn)
 
 async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
+    conn = get_connection()
+    db = Database(conn)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
@@ -41,7 +61,9 @@ async def init_db():
             stripe_subscription_id TEXT,
             is_admin BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW()
-        );
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             id SERIAL PRIMARY KEY,
             user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -49,7 +71,9 @@ async def init_db():
             filters JSONB DEFAULT '{}',
             active BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW()
-        );
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS listings (
             id SERIAL PRIMARY KEY,
             profile_id INTEGER REFERENCES profiles(id) ON DELETE CASCADE,
@@ -61,7 +85,8 @@ async def init_db():
             attrs JSONB DEFAULT '{}',
             found_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE(profile_id, lbc_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_listings_profile ON listings(profile_id);
-        CREATE INDEX IF NOT EXISTS idx_profiles_active ON profiles(active) WHERE active=true;
-        """)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_listings_profile ON listings(profile_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_profiles_active ON profiles(active) WHERE active=true")
+    db.close()
